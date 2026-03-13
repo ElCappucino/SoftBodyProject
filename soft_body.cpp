@@ -18,6 +18,7 @@ void framebuffer_size_callback(GLFWwindow * window, int width, int height);
 void mouse_callback(GLFWwindow* window, double xpos, double ypos);
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset);
 void processInput(GLFWwindow* window);
+void mouse_button_callback(GLFWwindow* window, int button, int action, int mods);
 
 // settings
 const unsigned int SCR_WIDTH = 800;
@@ -28,6 +29,20 @@ Camera camera(glm::vec3(0.0f, 0.0f, 3.0f));
 float lastX = SCR_WIDTH / 2.0f;
 float lastY = SCR_HEIGHT / 2.0f;
 bool firstMouse = true;
+
+// mouse
+bool mouseClicked = false;
+bool holdRightMouse = false;
+double mouseX, mouseY;
+
+glm::vec3 currentMousePos;
+glm::vec3 previousMousePos;
+glm::vec3 mouseVelocity;
+
+int grabId = -1;
+float grabInvMass = 0.0;
+float grabbedDistance = 0.0f;
+bool mouseHeldLastFrame = false;
 
 // timing
 float deltaTime = 0.0f;
@@ -61,6 +76,78 @@ struct VolumeConstraint {
 float calculateVolume(glm::vec3 p0, glm::vec3 p1, glm::vec3 p2, glm::vec3 p3) {
     return glm::dot(p1 - p0, glm::cross(p2 - p0, p3 - p0)) / 6.0f;
 }
+
+glm::vec3 ScreenToWorldRay(
+    double mouseX,
+    double mouseY,
+    int screenWidth,
+    int screenHeight,
+    glm::mat4 projection,
+    glm::mat4 view)
+{
+    float x = (2.0f * mouseX) / screenWidth - 1.0f;
+    float y = 1.0f - (2.0f * mouseY) / screenHeight;
+    float z = 1.0f;
+
+    glm::vec3 ray_nds = glm::vec3(x, y, z);
+    glm::vec4 ray_clip = glm::vec4(ray_nds.x, ray_nds.y, -1.0f, 1.0f);
+
+    glm::vec4 ray_eye = glm::inverse(projection) * ray_clip;
+    ray_eye = glm::vec4(ray_eye.x, ray_eye.y, -1.0f, 0.0f);
+
+    glm::vec3 ray_world =
+        glm::vec3(glm::inverse(view) * ray_eye);
+
+    ray_world = glm::normalize(ray_world);
+
+    return ray_world;
+}
+
+bool RaySphereIntersect(
+    glm::vec3 rayOrigin,
+    glm::vec3 rayDir,
+    glm::vec3 sphereCenter,
+    float radius)
+{
+    glm::vec3 oc = rayOrigin - sphereCenter;
+
+    float b = glm::dot(oc, rayDir);
+    float c = glm::dot(oc, oc) - radius * radius;
+
+    float h = b * b - c;
+
+    return h >= 0.0;
+}
+
+int FindClosestParticle(
+    glm::vec3 rayOrigin,
+    glm::vec3 rayDir,
+    std::vector<Particle>& particles)
+{
+    float bestDist = 0.2f;   // pick radius
+    int bestIndex = -1;
+
+    for (int i = 0; i < particles.size(); i++)
+    {
+        glm::vec3 p = particles[i].position;
+
+        glm::vec3 v = p - rayOrigin;
+        float t = glm::dot(v, rayDir);
+
+        glm::vec3 closest = rayOrigin + rayDir * t;
+
+        float d = glm::length(p - closest);
+
+        if (d < bestDist)
+        {
+            bestDist = d;
+            bestIndex = i;
+        }
+    }
+
+    return bestIndex;
+}
+
 int main()
 {
     // glfw: initialize and configure
@@ -89,7 +176,10 @@ int main()
     glfwSetScrollCallback(window, scroll_callback);
 
     // tell GLFW to capture our mouse
-    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    //glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+
+    glfwSetMouseButtonCallback(window, mouse_button_callback);
 
     // glad: load all OpenGL function pointers
     // ---------------------------------------
@@ -253,7 +343,13 @@ int main()
 
         float dt = deltaTime;
 
+        // raycast mouse
 
+
+
+
+
+        // Presolve
         // calculate position by velocity
         for (auto& p : particles)
         {
@@ -263,22 +359,12 @@ int main()
             p.previousPosition = p.position;
             p.position += p.velocity * dt;
         }
+        
+        
 
-        // Presolve
-        // detect ground
-        for (auto& p : particles)
-        {
-            float groundY = -3.5f;
+        int solverIterations = 5;   // more = stiffer
 
-            if (p.position.y < groundY)
-            {
-                p.position.y = groundY;
-            }
-        }
-
-        int solverIterations = 1;   // more = stiffer
-
-
+        // solve
         for (int iter = 0; iter < solverIterations; ++iter)
         {
             // Distance Constraint
@@ -354,6 +440,15 @@ int main()
                 p3.position += lambda * p3.invMass * grad3;
             }
 
+            for (auto& p : particles)
+            {
+                float groundY = -3.5f;
+
+                if (p.position.y < groundY)
+                {
+                    p.position.y = groundY;
+                }
+            }
             
         }
 
@@ -392,6 +487,97 @@ int main()
         glm::mat4 projection = glm::perspective(glm::radians(camera.Zoom), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 100.0f);
         glm::mat4 view = camera.GetViewMatrix();
         glm::mat4 model = glm::mat4(1.0f);
+
+        // hold mouse to grab
+        bool mouseNow = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+        previousMousePos = currentMousePos;
+
+        // start grab
+        if (mouseNow && !mouseHeldLastFrame)
+        {
+            glfwGetCursorPos(window, &mouseX, &mouseY);
+
+            glm::vec3 rayDir = ScreenToWorldRay(mouseX, mouseY, SCR_WIDTH, SCR_HEIGHT, projection, view);
+
+            glm::vec3 rayOrigin = camera.Position;
+
+            // P
+            currentMousePos = rayOrigin + rayDir * grabbedDistance;
+
+            grabId = -1;
+
+            // find particle with min distance
+            grabId = FindClosestParticle(rayOrigin, rayDir, particles);
+
+            if (grabId >= 0)
+            {
+                glm::vec3 p = particles[grabId].position;
+                grabbedDistance = glm::dot(p - rayOrigin, rayDir);
+
+                grabInvMass = particles[grabId].invMass;
+                particles[grabId].invMass = 0.0f;
+                particles[grabId].position = currentMousePos;
+            }
+        }
+
+        // moveGrabbed
+        if (mouseNow && grabId >= 0)
+        {
+            glfwGetCursorPos(window, &mouseX, &mouseY);
+
+            glm::vec3 rayDir = ScreenToWorldRay(mouseX, mouseY, SCR_WIDTH, SCR_HEIGHT, projection, view);
+
+            glm::vec3 rayOrigin = camera.Position;
+
+            // p in ten-minutes code
+            glm::vec3 target = rayOrigin + rayDir * grabbedDistance;
+
+            // vecCopy(this.pos,this.grabId, p,0);
+            particles[grabId].position = target;
+        }
+
+        // endGrab
+        if (!mouseNow && mouseHeldLastFrame)
+        {
+            if (grabId >= 0)
+            {
+                glm::vec3 mouseVelocity = (currentMousePos - previousMousePos) / dt;
+
+                particles[grabId].invMass = grabInvMass;
+                particles[grabId].velocity = mouseVelocity;
+            }
+            grabId = -1;
+        }
+
+        mouseHeldLastFrame = mouseNow;
+
+        glm::vec3 rayDir;
+
+        if (mouseClicked)
+        {
+            rayDir = ScreenToWorldRay(
+                mouseX,
+                mouseY,
+                SCR_WIDTH,
+                SCR_HEIGHT,
+                projection,
+                view);
+
+            glm::vec3 rayOrigin = camera.Position;
+
+            glm::vec3 center =
+                (particles[0].position +
+                    particles[1].position +
+                    particles[2].position +
+                    particles[3].position) / 4.0f;
+
+            if (RaySphereIntersect(rayOrigin, rayDir, center, 1.0f))
+            {
+                std::cout << "Tetrahedron clicked!" << std::endl;
+            }
+
+            mouseClicked = false;
+        }
 
         simpleShader.use();
 
@@ -475,7 +661,13 @@ void mouse_callback(GLFWwindow* window, double xposIn, double yposIn)
     lastX = xpos;
     lastY = ypos;
 
-    camera.ProcessMouseMovement(xoffset, yoffset);
+    if (holdRightMouse)
+    {
+        camera.ProcessMouseMovement(xoffset, yoffset);
+    }
+    
+
+
 }
 
 // glfw: whenever the mouse scroll wheel scrolls, this callback is called
@@ -483,4 +675,23 @@ void mouse_callback(GLFWwindow* window, double xposIn, double yposIn)
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset)
 {
     camera.ProcessMouseScroll(static_cast<float>(yoffset));
+}
+
+void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
+{
+    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS)
+    {
+        mouseClicked = true;
+        glfwGetCursorPos(window, &mouseX, &mouseY);
+    }
+
+    if (button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_PRESS)
+    {
+        holdRightMouse = true;
+    }
+
+    if (button == GLFW_MOUSE_BUTTON_RIGHT && action == GLFW_RELEASE)
+    {
+        holdRightMouse = false;
+    }
 }
